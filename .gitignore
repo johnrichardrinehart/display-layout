@@ -1,0 +1,7 @@
+.direnv/
+.pre-commit-config.yaml
+result
+*.o
+display-layout
+tests/config_test
+tests/backend_niri_test

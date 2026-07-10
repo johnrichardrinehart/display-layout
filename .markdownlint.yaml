@@ -1,0 +1,3 @@
+# Documentation includes commands, hashes, and links that are clearer when
+# kept intact than when wrapped to an arbitrary source-column limit.
+MD013: false
