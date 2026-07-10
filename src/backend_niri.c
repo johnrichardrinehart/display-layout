@@ -3,6 +3,7 @@
 #include "backend_niri.h"
 
 #include "backend.h"
+#include "identifier_wayland.h"
 #include "third_party/jsmn.h"
 
 #include <errno.h>
@@ -294,110 +295,10 @@ static int niri_apply(DisplayBackend *backend, const DisplayList *list,
   return 0;
 }
 
-static int window_id_for_identifier(const char *number) {
-  char *argv[] = {"niri", "msg", "--json", "windows", NULL};
-  char *json = NULL;
-  char error[128];
-  if (capture_command(argv, &json, error, sizeof(error)) != 0) {
-    return -1;
-  }
-  jsmntok_t *tokens = calloc(JSON_TOKEN_LIMIT, sizeof(*tokens));
-  if (tokens == NULL) {
-    free(json);
-    return -1;
-  }
-  jsmn_parser parser;
-  jsmn_init(&parser);
-  int count = jsmn_parse(&parser, json, strlen(json), tokens, JSON_TOKEN_LIMIT);
-  int result = -1;
-  if (count > 0 && tokens[0].type == JSMN_ARRAY) {
-    int cursor = 1;
-    for (int index = 0; index < tokens[0].size; index++) {
-      int window = cursor;
-      cursor = token_skip(tokens, cursor);
-      int title_token = object_get(json, tokens, window, "title");
-      int id_token = object_get(json, tokens, window, "id");
-      if (title_token >= 0 && id_token >= 0) {
-        char title[128];
-        char expected[96];
-        token_string(json, &tokens[title_token], title, sizeof(title));
-        snprintf(expected, sizeof(expected), "Display Layout Identifier %s",
-                 number);
-        if (strcmp(title, expected) == 0) {
-          result = token_integer(json, &tokens[id_token], -1);
-          break;
-        }
-      }
-    }
-  }
-  free(tokens);
-  free(json);
-  return result;
-}
-
-static int focused_window_id(void) {
-  char *argv[] = {"niri", "msg", "--json", "focused-window", NULL};
-  char *json = NULL;
-  char error[128];
-  if (capture_command(argv, &json, error, sizeof(error)) != 0) {
-    return -1;
-  }
-  jsmn_parser parser;
-  jsmntok_t tokens[64];
-  jsmn_init(&parser);
-  int count = jsmn_parse(&parser, json, strlen(json), tokens, 64);
-  int id_token = count > 0 ? object_get(json, tokens, 0, "id") : -1;
-  int id = id_token >= 0 ? token_integer(json, &tokens[id_token], -1) : -1;
-  free(json);
-  return id;
-}
-
-static void focus_window(int id) {
-  if (id < 0) {
-    return;
-  }
-  char id_text[32];
-  char error[128];
-  snprintf(id_text, sizeof(id_text), "%d", id);
-  char *argv[] = {"niri", "msg",   "action", "focus-window",
-                  "--id", id_text, NULL};
-  run_command(argv, error, sizeof(error));
-}
-
-static void prepare_identifier(const char *number) {
-  int id = -1;
-  struct timespec pause = {.tv_sec = 0, .tv_nsec = 20000000L};
-  for (int attempt = 0; attempt < 100 && id < 0; attempt++) {
-    nanosleep(&pause, NULL);
-    id = window_id_for_identifier(number);
-  }
-  if (id < 0) {
-    return;
-  }
-  char id_text[32];
-  char error[128];
-  snprintf(id_text, sizeof(id_text), "%d", id);
-  char *floating[] = {"niri", "msg",   "action", "move-window-to-floating",
-                      "--id", id_text, NULL};
-  char *center[] = {"niri", "msg",   "action", "center-window",
-                    "--id", id_text, NULL};
-  run_command(floating, error, sizeof(error));
-  run_command(center, error, sizeof(error));
-}
-
 static int niri_identify(DisplayBackend *backend, const DisplayList *list,
                          unsigned int duration_ms, char *error,
                          size_t error_size) {
   (void)backend;
-  char executable[4096];
-  ssize_t length =
-      readlink("/proc/self/exe", executable, sizeof(executable) - 1);
-  if (length <= 0) {
-    snprintf(error, error_size, "cannot locate identifier executable");
-    return -1;
-  }
-  executable[length] = '\0';
-
   const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
   if (runtime_dir == NULL || runtime_dir[0] == '\0') {
     runtime_dir = "/tmp";
@@ -432,39 +333,14 @@ static int niri_identify(DisplayBackend *backend, const DisplayList *list,
       _exit(0);
     }
     setsid();
-    int original_window = focused_window_id();
-    pid_t overlays[DISPLAY_LAYOUT_MAX_DISPLAYS] = {0};
-    char duration[32];
-    snprintf(duration, sizeof(duration), "%u", duration_ms);
-    for (size_t index = 0; index < list->count; index++) {
-      char number[16];
-      char command_error[128];
-      snprintf(number, sizeof(number), "%u", (unsigned int)index + 1U);
-      char *focus_output[] = {"niri",
-                              "msg",
-                              "action",
-                              "focus-monitor",
-                              (char *)list->displays[index].connector,
-                              NULL};
-      run_command(focus_output, command_error, sizeof(command_error));
-      overlays[index] = fork();
-      if (overlays[index] == 0) {
-        execl(executable, executable, "--identify-overlay", number, duration,
-              (char *)NULL);
-        _exit(127);
-      }
-      if (overlays[index] > 0) {
-        prepare_identifier(number);
-      }
+    char identify_error[256];
+    int result = identifier_wayland_show(list, duration_ms, identify_error,
+                                         sizeof(identify_error));
+    if (result != 0) {
+      fprintf(stderr, "display-layout: %s\n", identify_error);
     }
-    for (size_t index = 0; index < list->count; index++) {
-      if (overlays[index] > 0) {
-        waitpid(overlays[index], NULL, 0);
-      }
-    }
-    focus_window(original_window);
     close(lock_fd);
-    _exit(0);
+    _exit(result == 0 ? 0 : 1);
   }
   waitpid(launcher, NULL, 0);
   close(lock_fd);

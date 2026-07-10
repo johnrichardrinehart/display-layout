@@ -41,6 +41,13 @@
           name = "C tests";
           entry = toString (
             pkgs.writeShellScript "display-layout-tests" ''
+              export PATH=${
+                pkgs.lib.makeBinPath [
+                  pkgs.pkg-config
+                  pkgs.wayland-scanner
+                ]
+              }:$PATH
+              export PKG_CONFIG_PATH=${pkgs.wlr-protocols}/share/pkgconfig:${pkgs.wayland-protocols}/share/pkgconfig:${pkgs.wayland.dev}/lib/pkgconfig
               ${pkgs.gnumake}/bin/make CC=${pkgs.stdenv.cc}/bin/cc check
             ''
           );
@@ -67,6 +74,11 @@
           pkgs.desktop-file-utils
           pkgs.libX11
           pkgs.libXrender
+          pkgs.pkg-config
+          pkgs.wayland
+          pkgs.wayland-scanner
+          pkgs.wayland-protocols
+          pkgs.wlr-protocols
         ];
         shellHook = config.pre-commit.installationScript;
       };

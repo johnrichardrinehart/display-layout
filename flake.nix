@@ -56,12 +56,24 @@
             };
 
             strictDeps = true;
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.wayland-scanner
+              pkgs.wayland-protocols
+              pkgs.wlr-protocols
+            ];
             buildInputs = [
               pkgs.libX11
               pkgs.libXrender
+              pkgs.wayland
             ];
-            makeFlags = [ "VERSION=${version}" ];
+            makeFlags = [
+              "VERSION=${version}"
+              "WLR_PROTOCOLS_DIR=${pkgs.wlr-protocols}/share/wlr-protocols"
+              "WAYLAND_PROTOCOLS_DIR=${pkgs.wayland-protocols}/share/wayland-protocols"
+            ];
             doCheck = true;
+            checkTarget = "check";
             installFlags = [
               "DESTDIR=$(out)"
               "PREFIX="

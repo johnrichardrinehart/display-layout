@@ -18,7 +18,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define STB_TRUETYPE_IMPLEMENTATION
 #include "third_party/stb_truetype.h"
 
 #ifndef DISPLAY_LAYOUT_VERSION
@@ -27,7 +26,6 @@
 
 static const double PI = 3.14159265358979323846;
 static const double DEGREES_TO_RADIANS = PI / 180.0;
-static const double IDENTIFY_FADE_START = 0.55;
 static const float MILLIMETERS_PER_INCH = 25.4F;
 static const float LAYOUT_WIDTH_FRACTION = 0.84F;
 static const float LAYOUT_HEIGHT_FRACTION = 0.76F;
@@ -697,98 +695,6 @@ static void configure_dialog_window(Ui *ui) {
   XSetWMNormalHints(ui->x_display, ui->window, &size_hints);
 }
 
-static int run_identify_overlay(const char *number, unsigned int duration_ms) {
-  AppConfig config;
-  config_defaults(&config);
-  config.font_size = 144;
-  Ui ui = {0};
-  ui.x_display = XOpenDisplay(NULL);
-  if (ui.x_display == NULL) {
-    return 1;
-  }
-  ui.screen = DefaultScreen(ui.x_display);
-  ui.visual = DefaultVisual(ui.x_display, ui.screen);
-  ui.colormap = DefaultColormap(ui.x_display, ui.screen);
-  ui.width = 240;
-  ui.height = 240;
-  ui.window = XCreateSimpleWindow(
-      ui.x_display, RootWindow(ui.x_display, ui.screen), 0, 0,
-      (unsigned int)ui.width, (unsigned int)ui.height, 0, 0, 0);
-  char title[96];
-  snprintf(title, sizeof(title), "Display Layout Identifier %s", number);
-  XStoreName(ui.x_display, ui.window, title);
-  XClassHint class_hint = {.res_name = "display-layout-identifier",
-                           .res_class = "DisplayLayoutIdentifier"};
-  XSetClassHint(ui.x_display, ui.window, &class_hint);
-  configure_dialog_window(&ui);
-  Atom state = XInternAtom(ui.x_display, "_NET_WM_STATE", False);
-  Atom above = XInternAtom(ui.x_display, "_NET_WM_STATE_ABOVE", False);
-  XChangeProperty(ui.x_display, ui.window, state, XA_ATOM, 32, PropModeReplace,
-                  (unsigned char *)&above, 1);
-  resize_buffer(&ui, ui.width, ui.height);
-  ui.theme = dark_theme(&ui);
-  char font_path[1024];
-  const char *resolved_font =
-      resolve_font_path(&config, font_path, sizeof(font_path));
-  if (load_font(&ui, resolved_font, config.font_size) != 0) {
-    XCloseDisplay(ui.x_display);
-    return 1;
-  }
-  Atom opacity = XInternAtom(ui.x_display, "_NET_WM_WINDOW_OPACITY", False);
-  fill_rect(&ui, (Rect){0, 0, ui.width, ui.height}, ui.theme.surface);
-  fill_rounded(&ui, (Rect){8, 8, ui.width - 16, ui.height - 16}, 28,
-               ui.theme.monitor_inner);
-  stroke_rect(&ui, (Rect){8, 8, ui.width - 16, ui.height - 16}, 3,
-              ui.theme.accent);
-  draw_text_centered(&ui, number, (Rect){0, 0, ui.width, ui.height},
-                     ui.theme.white);
-  XSetWindowBackgroundPixmap(ui.x_display, ui.window, ui.buffer);
-  XMapRaised(ui.x_display, ui.window);
-  XSync(ui.x_display, False);
-  XCopyArea(ui.x_display, ui.buffer, ui.window, ui.gc, 0, 0,
-            (unsigned int)ui.width, (unsigned int)ui.height, 0, 0);
-  XFlush(ui.x_display);
-
-  struct timespec start;
-  clock_gettime(CLOCK_MONOTONIC, &start);
-  for (;;) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long long elapsed_nanoseconds =
-        (long long)(now.tv_sec - start.tv_sec) * 1000000000LL +
-        (long long)(now.tv_nsec - start.tv_nsec);
-    unsigned long elapsed = (unsigned long)(elapsed_nanoseconds / 1000000LL);
-    if (elapsed >= duration_ms) {
-      break;
-    }
-    double progress = (double)elapsed / (double)duration_ms;
-    double alpha = progress < IDENTIFY_FADE_START
-                       ? 1.0
-                       : (1.0 - progress) / (1.0 - IDENTIFY_FADE_START);
-    unsigned long value = (unsigned long)(alpha * 4294967295.0);
-    while (XPending(ui.x_display) > 0) {
-      XEvent event;
-      XNextEvent(ui.x_display, &event);
-    }
-    XCopyArea(ui.x_display, ui.buffer, ui.window, ui.gc, 0, 0,
-              (unsigned int)ui.width, (unsigned int)ui.height, 0, 0);
-    XChangeProperty(ui.x_display, ui.window, opacity, XA_CARDINAL, 32,
-                    PropModeReplace, (unsigned char *)&value, 1);
-    XFlush(ui.x_display);
-    struct timespec pause = {.tv_sec = 0, .tv_nsec = 16000000L};
-    nanosleep(&pause, NULL);
-  }
-
-  XRenderFreePicture(ui.x_display, ui.font.atlas_picture);
-  XFreePixmap(ui.x_display, ui.font.atlas_pixmap);
-  XRenderFreePicture(ui.x_display, ui.target_picture);
-  XFreeGC(ui.x_display, ui.gc);
-  XFreePixmap(ui.x_display, ui.buffer);
-  XDestroyWindow(ui.x_display, ui.window);
-  XCloseDisplay(ui.x_display);
-  return 0;
-}
-
 static void print_usage(FILE *stream) {
   fprintf(
       stream,
@@ -797,11 +703,6 @@ static void print_usage(FILE *stream) {
 }
 
 int main(int argc, char **argv) {
-  if (argc == 4 && strcmp(argv[1], "--identify-overlay") == 0) {
-    unsigned long duration = strtoul(argv[3], NULL, 10);
-    return run_identify_overlay(argv[2], (unsigned int)duration);
-  }
-
   AppConfig config;
   config_defaults(&config);
   char config_path[1024];
