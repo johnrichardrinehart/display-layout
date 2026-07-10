@@ -1,6 +1,7 @@
 .direnv/
 .pre-commit-config.yaml
 result
+generated/
 *.o
 display-layout
 tests/config_test
