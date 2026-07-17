@@ -64,8 +64,7 @@
               pkgs.wlr-protocols
             ];
             buildInputs = [
-              pkgs.libX11
-              pkgs.libXrender
+              pkgs.libxkbcommon
               pkgs.wayland
             ];
             makeFlags = [

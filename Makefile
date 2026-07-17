@@ -10,16 +10,19 @@ XDG_SHELL_XML = $(WAYLAND_PROTOCOLS_DIR)/stable/xdg-shell/xdg-shell.xml
 GENERATED_DIR = generated
 LAYER_SHELL_HEADER = $(GENERATED_DIR)/wlr-layer-shell-unstable-v1-client-protocol.h
 LAYER_SHELL_CODE = $(GENERATED_DIR)/wlr-layer-shell-unstable-v1-protocol.c
+XDG_SHELL_HEADER = $(GENERATED_DIR)/xdg-shell-client-protocol.h
 XDG_SHELL_CODE = $(GENERATED_DIR)/xdg-shell-protocol.c
 
 WAYLAND_CFLAGS = $(shell pkg-config --cflags wayland-client)
 WAYLAND_LIBS = $(shell pkg-config --libs wayland-client)
+XKBCOMMON_CFLAGS = $(shell pkg-config --cflags xkbcommon)
+XKBCOMMON_LIBS = $(shell pkg-config --libs xkbcommon)
 
-CPPFLAGS += -Isrc -I$(GENERATED_DIR) $(WAYLAND_CFLAGS) -DDISPLAY_LAYOUT_VERSION='"$(VERSION)"'
+CPPFLAGS += -Isrc -I$(GENERATED_DIR) $(WAYLAND_CFLAGS) $(XKBCOMMON_CFLAGS) -DDISPLAY_LAYOUT_VERSION='"$(VERSION)"'
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS ?=
-UI_LIBS = -lX11 -lXrender $(WAYLAND_LIBS)
+UI_LIBS = $(WAYLAND_LIBS) $(XKBCOMMON_LIBS)
 
 BACKEND_SOURCES = src/backend.c src/backend_common.c src/jsmn_impl.c src/backend_niri.c \
                   src/backend_sway.c src/backend_hyprland.c src/backend_wlr.c \
@@ -43,13 +46,18 @@ $(LAYER_SHELL_CODE): $(LAYER_SHELL_XML) $(LAYER_SHELL_HEADER)
 	mkdir -p $(GENERATED_DIR)
 	$(WAYLAND_SCANNER) private-code $< $@
 
-$(XDG_SHELL_CODE): $(XDG_SHELL_XML)
+$(XDG_SHELL_HEADER): $(XDG_SHELL_XML)
+	mkdir -p $(GENERATED_DIR)
+	$(WAYLAND_SCANNER) client-header $< $@
+
+$(XDG_SHELL_CODE): $(XDG_SHELL_XML) $(XDG_SHELL_HEADER)
 	mkdir -p $(GENERATED_DIR)
 	$(WAYLAND_SCANNER) private-code $< $@
 
-src/main.o: CFLAGS += $(UI_CFLAGS)
+src/main.o: $(XDG_SHELL_HEADER)
 src/identifier_wayland.o: $(LAYER_SHELL_HEADER)
 $(LAYER_SHELL_CODE:.c=.o): $(LAYER_SHELL_HEADER)
+$(XDG_SHELL_CODE:.c=.o): $(XDG_SHELL_HEADER)
 
 tests/config_test: tests/config_test.c src/config.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/config_test.c src/config.c

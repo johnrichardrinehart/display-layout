@@ -4,19 +4,20 @@
 #include "config.h"
 #include "model.h"
 
-#include <X11/Xatom.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/cursorfont.h>
-#include <X11/extensions/Xrender.h>
-#include <X11/keysym.h>
+#include "xdg-shell-client-protocol.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "third_party/stb_truetype.h"
 
@@ -24,8 +25,6 @@
 #define DISPLAY_LAYOUT_VERSION "development"
 #endif
 
-static const double PI = 3.14159265358979323846;
-static const double DEGREES_TO_RADIANS = PI / 180.0;
 static const float MILLIMETERS_PER_INCH = 25.4F;
 static const float LAYOUT_WIDTH_FRACTION = 0.84F;
 static const float LAYOUT_HEIGHT_FRACTION = 0.76F;
@@ -45,7 +44,7 @@ enum {
   UI_CLOSE_RADIUS = 16,
   UI_BADGE_SIZE = 34,
   UI_BADGE_MARGIN = 12,
-  ROUNDED_CORNER_STEPS = 8,
+  FRAME_BUFFER_COUNT = 2,
 };
 
 typedef struct {
@@ -55,14 +54,10 @@ typedef struct {
   int height;
 } Rect;
 
-typedef struct {
-  unsigned long pixel;
-  Picture picture;
-} UiColor;
+typedef uint32_t UiColor;
 
 typedef struct {
-  Pixmap atlas_pixmap;
-  Picture atlas_picture;
+  unsigned char *atlas;
   stbtt_bakedchar glyphs[95];
   int ascent;
   int descent;
@@ -99,57 +94,565 @@ typedef struct {
 } SnapResult;
 
 typedef struct {
-  Display *x_display;
-  int screen;
-  Window window;
-  Pixmap buffer;
-  Drawable target;
-  Picture target_picture;
-  Visual *visual;
-  Colormap colormap;
-  GC gc;
+  struct wl_buffer *buffer;
+  uint32_t *pixels;
+  bool busy;
+} FrameBuffer;
+
+typedef struct {
+  struct wl_display *display;
+  struct wl_registry *registry;
+  struct wl_compositor *compositor;
+  struct wl_shm *shm;
+  struct wl_seat *seat;
+  struct wl_pointer *pointer;
+  struct wl_keyboard *keyboard;
+  struct xdg_wm_base *wm_base;
+  struct wl_surface *surface;
+  struct xdg_surface *xdg_surface;
+  struct xdg_toplevel *toplevel;
+  struct xkb_context *xkb_context;
+  struct xkb_keymap *xkb_keymap;
+  struct xkb_state *xkb_state;
+  struct wl_shm_pool *pool;
+  void *pool_data;
+  size_t pool_size;
+  FrameBuffer buffers[FRAME_BUFFER_COUNT];
+  uint32_t *pixels;
+  int current_buffer;
   FontRenderer font;
-  Cursor normal_cursor;
-  Cursor hand_cursor;
   Theme theme;
   int width;
   int height;
+  int mouse_x;
+  int mouse_y;
+  xkb_keysym_t key;
+  bool configured;
+  bool close_requested;
+  bool pointer_pressed;
+  bool pointer_released;
+  bool key_pressed;
+  bool control_down;
+  bool shift_down;
+  bool needs_redraw;
 } Ui;
 
-static void resize_buffer(Ui *ui, int width, int height) {
-  if (ui->target_picture != 0) {
-    XRenderFreePicture(ui->x_display, ui->target_picture);
+static int anonymous_file(size_t size) {
+  const char *runtime = getenv("XDG_RUNTIME_DIR");
+  if (runtime == NULL || runtime[0] == '\0') {
+    errno = ENOENT;
+    return -1;
   }
-  if (ui->gc != 0) {
-    XFreeGC(ui->x_display, ui->gc);
+  char path[4096];
+  snprintf(path, sizeof(path), "%s/display-layout-ui-XXXXXX", runtime);
+  int fd = mkstemp(path);
+  if (fd < 0)
+    return -1;
+  unlink(path);
+  int flags = fcntl(fd, F_GETFD);
+  if (flags >= 0)
+    fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+  if (ftruncate(fd, (off_t)size) != 0) {
+    close(fd);
+    return -1;
   }
-  if (ui->buffer != 0) {
-    XFreePixmap(ui->x_display, ui->buffer);
+  return fd;
+}
+
+static void frame_buffer_release(void *data, struct wl_buffer *buffer) {
+  (void)buffer;
+  ((FrameBuffer *)data)->busy = false;
+}
+
+static const struct wl_buffer_listener FRAME_BUFFER_LISTENER = {
+    .release = frame_buffer_release,
+};
+
+static void destroy_buffers(Ui *ui) {
+  for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+    if (ui->buffers[i].buffer != NULL)
+      wl_buffer_destroy(ui->buffers[i].buffer);
+    ui->buffers[i] = (FrameBuffer){0};
   }
+  if (ui->pool != NULL)
+    wl_shm_pool_destroy(ui->pool);
+  if (ui->pool_data != NULL)
+    munmap(ui->pool_data, ui->pool_size);
+  ui->pool = NULL;
+  ui->pool_data = NULL;
+  ui->pool_size = 0;
+  ui->pixels = NULL;
+}
+
+static int resize_buffer(Ui *ui, int width, int height) {
+  destroy_buffers(ui);
   ui->width = width;
   ui->height = height;
-  ui->buffer = XCreatePixmap(
-      ui->x_display, ui->window, (unsigned int)width, (unsigned int)height,
-      (unsigned int)DefaultDepth(ui->x_display, ui->screen));
-  ui->target = ui->buffer;
-  ui->gc = XCreateGC(ui->x_display, ui->buffer, 0, NULL);
-  XRenderPictFormat *format =
-      XRenderFindVisualFormat(ui->x_display, ui->visual);
-  ui->target_picture =
-      XRenderCreatePicture(ui->x_display, ui->buffer, format, 0, NULL);
+  size_t frame_size = (size_t)width * (size_t)height * sizeof(uint32_t);
+  ui->pool_size = frame_size * FRAME_BUFFER_COUNT;
+  int fd = anonymous_file(ui->pool_size);
+  if (fd < 0)
+    return -1;
+  ui->pool_data =
+      mmap(NULL, ui->pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ui->pool_data == MAP_FAILED) {
+    ui->pool_data = NULL;
+    close(fd);
+    return -1;
+  }
+  ui->pool = wl_shm_create_pool(ui->shm, fd, (int32_t)ui->pool_size);
+  close(fd);
+  for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+    size_t offset = frame_size * (size_t)i;
+    ui->buffers[i].pixels =
+        (uint32_t *)((unsigned char *)ui->pool_data + offset);
+    ui->buffers[i].buffer =
+        wl_shm_pool_create_buffer(ui->pool, (int32_t)offset, width, height,
+                                  width * 4, WL_SHM_FORMAT_XRGB8888);
+    wl_buffer_add_listener(ui->buffers[i].buffer, &FRAME_BUFFER_LISTENER,
+                           &ui->buffers[i]);
+  }
+  return 0;
+}
+
+static void wm_base_ping(void *data, struct xdg_wm_base *wm_base,
+                         uint32_t serial) {
+  (void)data;
+  xdg_wm_base_pong(wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener WM_BASE_LISTENER = {
+    .ping = wm_base_ping,
+};
+
+static void pointer_enter(void *data, struct wl_pointer *pointer,
+                          uint32_t serial, struct wl_surface *surface,
+                          wl_fixed_t x, wl_fixed_t y) {
+  (void)pointer;
+  (void)serial;
+  (void)surface;
+  Ui *ui = data;
+  ui->mouse_x = wl_fixed_to_int(x);
+  ui->mouse_y = wl_fixed_to_int(y);
+  ui->needs_redraw = true;
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer,
+                          uint32_t serial, struct wl_surface *surface) {
+  (void)pointer;
+  (void)serial;
+  (void)surface;
+  Ui *ui = data;
+  ui->mouse_x = -1;
+  ui->mouse_y = -1;
+  ui->needs_redraw = true;
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer,
+                           uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+  (void)pointer;
+  (void)time;
+  Ui *ui = data;
+  ui->mouse_x = wl_fixed_to_int(x);
+  ui->mouse_y = wl_fixed_to_int(y);
+  ui->needs_redraw = true;
+}
+
+static void pointer_button(void *data, struct wl_pointer *pointer,
+                           uint32_t serial, uint32_t time, uint32_t button,
+                           uint32_t state) {
+  (void)pointer;
+  (void)serial;
+  (void)time;
+  Ui *ui = data;
+  if (button != 0x110)
+    return;
+  if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+    ui->pointer_pressed = true;
+  else
+    ui->pointer_released = true;
+  ui->needs_redraw = true;
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+                         uint32_t axis, wl_fixed_t value) {
+  (void)data;
+  (void)pointer;
+  (void)time;
+  (void)axis;
+  (void)value;
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer) {
+  (void)data;
+  (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer,
+                                uint32_t axis_source) {
+  (void)data;
+  (void)pointer;
+  (void)axis_source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer,
+                              uint32_t time, uint32_t axis) {
+  (void)data;
+  (void)pointer;
+  (void)time;
+  (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
+                                  uint32_t axis, int32_t discrete) {
+  (void)data;
+  (void)pointer;
+  (void)axis;
+  (void)discrete;
+}
+
+static void pointer_axis_value120(void *data, struct wl_pointer *pointer,
+                                  uint32_t axis, int32_t value120) {
+  (void)data;
+  (void)pointer;
+  (void)axis;
+  (void)value120;
+}
+
+static void pointer_axis_relative_direction(void *data,
+                                            struct wl_pointer *pointer,
+                                            uint32_t axis, uint32_t direction) {
+  (void)data;
+  (void)pointer;
+  (void)axis;
+  (void)direction;
+}
+
+static const struct wl_pointer_listener POINTER_LISTENER = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+    .axis_value120 = pointer_axis_value120,
+    .axis_relative_direction = pointer_axis_relative_direction,
+};
+
+static void keyboard_keymap(void *data, struct wl_keyboard *keyboard,
+                            uint32_t format, int32_t fd, uint32_t size) {
+  (void)keyboard;
+  Ui *ui = data;
+  if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+    close(fd);
+    return;
+  }
+  char *keymap_text = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (keymap_text == MAP_FAILED)
+    return;
+  struct xkb_keymap *keymap = xkb_keymap_new_from_string(
+      ui->xkb_context, keymap_text, XKB_KEYMAP_FORMAT_TEXT_V1,
+      XKB_KEYMAP_COMPILE_NO_FLAGS);
+  munmap(keymap_text, size);
+  if (keymap == NULL)
+    return;
+  struct xkb_state *state = xkb_state_new(keymap);
+  if (state == NULL) {
+    xkb_keymap_unref(keymap);
+    return;
+  }
+  if (ui->xkb_state != NULL)
+    xkb_state_unref(ui->xkb_state);
+  if (ui->xkb_keymap != NULL)
+    xkb_keymap_unref(ui->xkb_keymap);
+  ui->xkb_keymap = keymap;
+  ui->xkb_state = state;
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
+                           uint32_t serial, struct wl_surface *surface,
+                           struct wl_array *keys) {
+  (void)data;
+  (void)keyboard;
+  (void)serial;
+  (void)surface;
+  (void)keys;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *keyboard,
+                           uint32_t serial, struct wl_surface *surface) {
+  (void)data;
+  (void)keyboard;
+  (void)serial;
+  (void)surface;
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *keyboard,
+                         uint32_t serial, uint32_t time, uint32_t key,
+                         uint32_t state) {
+  (void)keyboard;
+  (void)serial;
+  (void)time;
+  Ui *ui = data;
+  if (ui->xkb_state == NULL)
+    return;
+  bool pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+  xkb_state_update_key(ui->xkb_state, key + 8,
+                       pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+  if (pressed) {
+    ui->key = xkb_state_key_get_one_sym(ui->xkb_state, key + 8);
+    ui->key_pressed = true;
+    ui->needs_redraw = true;
+  }
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
+                               uint32_t serial, uint32_t depressed,
+                               uint32_t latched, uint32_t locked,
+                               uint32_t group) {
+  (void)keyboard;
+  (void)serial;
+  Ui *ui = data;
+  if (ui->xkb_state == NULL)
+    return;
+  xkb_state_update_mask(ui->xkb_state, depressed, latched, locked, 0, 0, group);
+  ui->control_down =
+      xkb_state_mod_name_is_active(ui->xkb_state, XKB_MOD_NAME_CTRL,
+                                   XKB_STATE_MODS_EFFECTIVE) > 0;
+  ui->shift_down =
+      xkb_state_mod_name_is_active(ui->xkb_state, XKB_MOD_NAME_SHIFT,
+                                   XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
+                                 int32_t rate, int32_t delay) {
+  (void)data;
+  (void)keyboard;
+  (void)rate;
+  (void)delay;
+}
+
+static const struct wl_keyboard_listener KEYBOARD_LISTENER = {
+    .keymap = keyboard_keymap,
+    .enter = keyboard_enter,
+    .leave = keyboard_leave,
+    .key = keyboard_key,
+    .modifiers = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *seat,
+                              uint32_t capabilities) {
+  Ui *ui = data;
+  if ((capabilities & WL_SEAT_CAPABILITY_POINTER) != 0 && ui->pointer == NULL) {
+    ui->pointer = wl_seat_get_pointer(seat);
+    wl_pointer_add_listener(ui->pointer, &POINTER_LISTENER, ui);
+  } else if ((capabilities & WL_SEAT_CAPABILITY_POINTER) == 0 &&
+             ui->pointer != NULL) {
+    wl_pointer_destroy(ui->pointer);
+    ui->pointer = NULL;
+  }
+  if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0 &&
+      ui->keyboard == NULL) {
+    ui->keyboard = wl_seat_get_keyboard(seat);
+    wl_keyboard_add_listener(ui->keyboard, &KEYBOARD_LISTENER, ui);
+  } else if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) == 0 &&
+             ui->keyboard != NULL) {
+    wl_keyboard_destroy(ui->keyboard);
+    ui->keyboard = NULL;
+  }
+}
+
+static void seat_name(void *data, struct wl_seat *seat, const char *name) {
+  (void)data;
+  (void)seat;
+  (void)name;
+}
+
+static const struct wl_seat_listener SEAT_LISTENER = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
+
+static void registry_global(void *data, struct wl_registry *registry,
+                            uint32_t name, const char *interface,
+                            uint32_t version) {
+  Ui *ui = data;
+  if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    uint32_t bind_version = version < 4 ? version : 4;
+    ui->compositor = wl_registry_bind(registry, name, &wl_compositor_interface,
+                                      bind_version);
+  } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+    ui->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+  } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+    ui->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+    xdg_wm_base_add_listener(ui->wm_base, &WM_BASE_LISTENER, ui);
+  } else if (strcmp(interface, wl_seat_interface.name) == 0 &&
+             ui->seat == NULL) {
+    uint32_t bind_version = version < 5 ? version : 5;
+    ui->seat =
+        wl_registry_bind(registry, name, &wl_seat_interface, bind_version);
+    wl_seat_add_listener(ui->seat, &SEAT_LISTENER, ui);
+  }
+}
+
+static void registry_remove(void *data, struct wl_registry *registry,
+                            uint32_t name) {
+  (void)data;
+  (void)registry;
+  (void)name;
+}
+
+static const struct wl_registry_listener REGISTRY_LISTENER = {
+    .global = registry_global,
+    .global_remove = registry_remove,
+};
+
+static void xdg_surface_configure(void *data, struct xdg_surface *surface,
+                                  uint32_t serial) {
+  Ui *ui = data;
+  xdg_surface_ack_configure(surface, serial);
+  ui->configured = true;
+  ui->needs_redraw = true;
+}
+
+static const struct xdg_surface_listener XDG_SURFACE_LISTENER = {
+    .configure = xdg_surface_configure,
+};
+
+static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+                               int32_t width, int32_t height,
+                               struct wl_array *states) {
+  (void)data;
+  (void)toplevel;
+  (void)width;
+  (void)height;
+  (void)states;
+}
+
+static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
+  (void)toplevel;
+  ((Ui *)data)->close_requested = true;
+}
+
+static const struct xdg_toplevel_listener TOPLEVEL_LISTENER = {
+    .configure = toplevel_configure,
+    .close = toplevel_close,
+};
+
+static int ui_init(Ui *ui, int width, int height, char *error,
+                   size_t error_size) {
+  *ui = (Ui){.width = width, .height = height, .mouse_x = -1, .mouse_y = -1};
+  ui->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (ui->xkb_context == NULL) {
+    snprintf(error, error_size, "cannot initialize Wayland keyboard support");
+    return -1;
+  }
+  ui->display = wl_display_connect(NULL);
+  if (ui->display == NULL) {
+    snprintf(error, error_size, "cannot connect to Wayland compositor");
+    return -1;
+  }
+  ui->registry = wl_display_get_registry(ui->display);
+  wl_registry_add_listener(ui->registry, &REGISTRY_LISTENER, ui);
+  if (wl_display_roundtrip(ui->display) < 0 || ui->compositor == NULL ||
+      ui->shm == NULL || ui->wm_base == NULL) {
+    snprintf(
+        error, error_size,
+        "Wayland compositor is missing xdg-shell or shared-memory support");
+    return -1;
+  }
+  wl_display_roundtrip(ui->display);
+  ui->surface = wl_compositor_create_surface(ui->compositor);
+  ui->xdg_surface = xdg_wm_base_get_xdg_surface(ui->wm_base, ui->surface);
+  xdg_surface_add_listener(ui->xdg_surface, &XDG_SURFACE_LISTENER, ui);
+  ui->toplevel = xdg_surface_get_toplevel(ui->xdg_surface);
+  xdg_toplevel_add_listener(ui->toplevel, &TOPLEVEL_LISTENER, ui);
+  xdg_toplevel_set_title(ui->toplevel, "Display Layout Editor");
+  xdg_toplevel_set_app_id(ui->toplevel, "display-layout-editor");
+  xdg_toplevel_set_min_size(ui->toplevel, width, height);
+  xdg_toplevel_set_max_size(ui->toplevel, width, height);
+  wl_surface_commit(ui->surface);
+  while (!ui->configured) {
+    if (wl_display_dispatch(ui->display) < 0) {
+      snprintf(error, error_size, "Wayland compositor closed the connection");
+      return -1;
+    }
+  }
+  if (resize_buffer(ui, width, height) != 0) {
+    snprintf(error, error_size, "cannot allocate Wayland drawing buffers: %s",
+             strerror(errno));
+    return -1;
+  }
+  return 0;
+}
+
+static int begin_frame(Ui *ui) {
+  for (;;) {
+    for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+      if (!ui->buffers[i].busy) {
+        ui->current_buffer = i;
+        ui->pixels = ui->buffers[i].pixels;
+        return 0;
+      }
+    }
+    if (wl_display_dispatch(ui->display) < 0)
+      return -1;
+  }
+}
+
+static void present_frame(Ui *ui) {
+  FrameBuffer *frame = &ui->buffers[ui->current_buffer];
+  frame->busy = true;
+  wl_surface_attach(ui->surface, frame->buffer, 0, 0);
+  wl_surface_damage_buffer(ui->surface, 0, 0, ui->width, ui->height);
+  wl_surface_commit(ui->surface);
+  wl_display_flush(ui->display);
+  ui->pixels = NULL;
+}
+
+static void ui_destroy(Ui *ui) {
+  free(ui->font.atlas);
+  destroy_buffers(ui);
+  if (ui->xkb_state != NULL)
+    xkb_state_unref(ui->xkb_state);
+  if (ui->xkb_keymap != NULL)
+    xkb_keymap_unref(ui->xkb_keymap);
+  if (ui->xkb_context != NULL)
+    xkb_context_unref(ui->xkb_context);
+  if (ui->keyboard != NULL)
+    wl_keyboard_destroy(ui->keyboard);
+  if (ui->pointer != NULL)
+    wl_pointer_destroy(ui->pointer);
+  if (ui->seat != NULL)
+    wl_seat_destroy(ui->seat);
+  if (ui->toplevel != NULL)
+    xdg_toplevel_destroy(ui->toplevel);
+  if (ui->xdg_surface != NULL)
+    xdg_surface_destroy(ui->xdg_surface);
+  if (ui->surface != NULL)
+    wl_surface_destroy(ui->surface);
+  if (ui->wm_base != NULL)
+    xdg_wm_base_destroy(ui->wm_base);
+  if (ui->shm != NULL)
+    wl_shm_destroy(ui->shm);
+  if (ui->compositor != NULL)
+    wl_compositor_destroy(ui->compositor);
+  if (ui->registry != NULL)
+    wl_registry_destroy(ui->registry);
+  if (ui->display != NULL)
+    wl_display_disconnect(ui->display);
 }
 
 static UiColor color(Ui *ui, unsigned short red, unsigned short green,
                      unsigned short blue) {
-  XColor xcolor = {.red = red,
-                   .green = green,
-                   .blue = blue,
-                   .flags = DoRed | DoGreen | DoBlue};
-  XAllocColor(ui->x_display, ui->colormap, &xcolor);
-  XRenderColor render = {
-      .red = red, .green = green, .blue = blue, .alpha = 65535};
-  return (UiColor){.pixel = xcolor.pixel,
-                   .picture = XRenderCreateSolidFill(ui->x_display, &render)};
+  (void)ui;
+  return 0xff000000U | ((uint32_t)(red >> 8) << 16) |
+         ((uint32_t)(green >> 8) << 8) | (uint32_t)(blue >> 8);
 }
 
 static Theme dark_theme(Ui *ui) {
@@ -194,14 +697,42 @@ static bool point_in_rect(int x, int y, Rect rectangle) {
          y < rectangle.y + rectangle.height;
 }
 
-static void set_gc_color(Ui *ui, UiColor color_value) {
-  XSetForeground(ui->x_display, ui->gc, color_value.pixel);
+static void put_pixel(Ui *ui, int x, int y, UiColor color_value) {
+  if (x >= 0 && y >= 0 && x < ui->width && y < ui->height)
+    ui->pixels[(size_t)y * (size_t)ui->width + (size_t)x] = color_value;
+}
+
+static void blend_pixel(Ui *ui, int x, int y, UiColor color_value,
+                        unsigned int alpha) {
+  if (x < 0 || y < 0 || x >= ui->width || y >= ui->height || alpha == 0)
+    return;
+  uint32_t *target = &ui->pixels[(size_t)y * (size_t)ui->width + (size_t)x];
+  unsigned int inverse = 255U - alpha;
+  unsigned int red = (((color_value >> 16) & 0xffU) * alpha +
+                      ((*target >> 16) & 0xffU) * inverse) /
+                     255U;
+  unsigned int green = (((color_value >> 8) & 0xffU) * alpha +
+                        ((*target >> 8) & 0xffU) * inverse) /
+                       255U;
+  unsigned int blue =
+      ((color_value & 0xffU) * alpha + (*target & 0xffU) * inverse) / 255U;
+  *target = 0xff000000U | (red << 16) | (green << 8) | blue;
 }
 
 static void fill_rect(Ui *ui, Rect rectangle, UiColor fill) {
-  set_gc_color(ui, fill);
-  XFillRectangle(ui->x_display, ui->target, ui->gc, rectangle.x, rectangle.y,
-                 (unsigned int)rectangle.width, (unsigned int)rectangle.height);
+  int start_x = rectangle.x < 0 ? 0 : rectangle.x;
+  int start_y = rectangle.y < 0 ? 0 : rectangle.y;
+  int end_x = rectangle.x + rectangle.width;
+  int end_y = rectangle.y + rectangle.height;
+  if (end_x > ui->width)
+    end_x = ui->width;
+  if (end_y > ui->height)
+    end_y = ui->height;
+  for (int y = start_y; y < end_y; y++) {
+    uint32_t *row = ui->pixels + (size_t)y * (size_t)ui->width;
+    for (int x = start_x; x < end_x; x++)
+      row[x] = fill;
+  }
 }
 
 static void fill_rounded(Ui *ui, Rect rectangle, int radius, UiColor fill) {
@@ -210,40 +741,67 @@ static void fill_rounded(Ui *ui, Rect rectangle, int radius, UiColor fill) {
     fill_rect(ui, rectangle, fill);
     return;
   }
-  XPointDouble points[4 * (ROUNDED_CORNER_STEPS + 1)];
-  int count = 0;
-  const double centers[4][3] = {
-      {rectangle.x + rectangle.width - radius, rectangle.y + radius, -90.0},
-      {rectangle.x + rectangle.width - radius,
-       rectangle.y + rectangle.height - radius, 0.0},
-      {rectangle.x + radius, rectangle.y + rectangle.height - radius, 90.0},
-      {rectangle.x + radius, rectangle.y + radius, 180.0},
-  };
-  for (int corner = 0; corner < 4; corner++) {
-    for (int step = 0; step <= ROUNDED_CORNER_STEPS; step++) {
-      double angle = (centers[corner][2] +
-                      (double)step * (90.0 / (double)ROUNDED_CORNER_STEPS)) *
-                     DEGREES_TO_RADIANS;
-      points[count++] = (XPointDouble){
-          .x = centers[corner][0] + cos(angle) * (double)radius,
-          .y = centers[corner][1] + sin(angle) * (double)radius,
-      };
+  for (int y = rectangle.y; y < rectangle.y + rectangle.height; y++) {
+    for (int x = rectangle.x; x < rectangle.x + rectangle.width; x++) {
+      int corner_x = x < rectangle.x + radius
+                         ? rectangle.x + radius
+                         : (x >= rectangle.x + rectangle.width - radius
+                                ? rectangle.x + rectangle.width - radius - 1
+                                : x);
+      int corner_y = y < rectangle.y + radius
+                         ? rectangle.y + radius
+                         : (y >= rectangle.y + rectangle.height - radius
+                                ? rectangle.y + rectangle.height - radius - 1
+                                : y);
+      int dx = x - corner_x;
+      int dy = y - corner_y;
+      if (dx * dx + dy * dy <= radius * radius)
+        put_pixel(ui, x, y, fill);
     }
   }
-  XRenderPictFormat *mask =
-      XRenderFindStandardFormat(ui->x_display, PictStandardA8);
-  XRenderCompositeDoublePoly(ui->x_display, PictOpOver, fill.picture,
-                             ui->target_picture, mask, 0, 0, 0, 0, points,
-                             count, EvenOddRule);
+}
+
+static void draw_line(Ui *ui, int x0, int y0, int x1, int y1, int width,
+                      bool dashed, UiColor color_value) {
+  int dx = abs(x1 - x0);
+  int sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0);
+  int sy = y0 < y1 ? 1 : -1;
+  int error = dx + dy;
+  int step = 0;
+  for (;;) {
+    if (!dashed || step % 11 < 6) {
+      int half = width / 2;
+      fill_rect(ui, (Rect){x0 - half, y0 - half, width, width}, color_value);
+    }
+    if (x0 == x1 && y0 == y1)
+      break;
+    int twice = error * 2;
+    if (twice >= dy) {
+      error += dy;
+      x0 += sx;
+    }
+    if (twice <= dx) {
+      error += dx;
+      y0 += sy;
+    }
+    step++;
+  }
 }
 
 static void stroke_rect(Ui *ui, Rect rectangle, int width, UiColor stroke) {
-  set_gc_color(ui, stroke);
-  XSetLineAttributes(ui->x_display, ui->gc, (unsigned int)width, LineSolid,
-                     CapRound, JoinRound);
-  XDrawRectangle(ui->x_display, ui->target, ui->gc, rectangle.x, rectangle.y,
-                 (unsigned int)(rectangle.width - 1),
-                 (unsigned int)(rectangle.height - 1));
+  fill_rect(ui, (Rect){rectangle.x, rectangle.y, rectangle.width, width},
+            stroke);
+  fill_rect(ui,
+            (Rect){rectangle.x, rectangle.y + rectangle.height - width,
+                   rectangle.width, width},
+            stroke);
+  fill_rect(ui, (Rect){rectangle.x, rectangle.y, width, rectangle.height},
+            stroke);
+  fill_rect(ui,
+            (Rect){rectangle.x + rectangle.width - width, rectangle.y, width,
+                   rectangle.height},
+            stroke);
 }
 
 static int load_font(Ui *ui, const char *path, int pixel_size) {
@@ -276,22 +834,7 @@ static int load_font(Ui *ui, const char *path, int pixel_size) {
     return -1;
   }
 
-  ui->font.atlas_pixmap = XCreatePixmap(ui->x_display, ui->window,
-                                        FONT_ATLAS_SIZE, FONT_ATLAS_SIZE, 8);
-  GC atlas_gc = XCreateGC(ui->x_display, ui->font.atlas_pixmap, 0, NULL);
-  XImage *image =
-      XCreateImage(ui->x_display, ui->visual, 8, ZPixmap, 0, (char *)bitmap,
-                   FONT_ATLAS_SIZE, FONT_ATLAS_SIZE, 8, FONT_ATLAS_SIZE);
-  XPutImage(ui->x_display, ui->font.atlas_pixmap, atlas_gc, image, 0, 0, 0, 0,
-            FONT_ATLAS_SIZE, FONT_ATLAS_SIZE);
-  image->data = NULL;
-  XDestroyImage(image);
-  free(bitmap);
-  XFreeGC(ui->x_display, atlas_gc);
-  XRenderPictFormat *alpha_format =
-      XRenderFindStandardFormat(ui->x_display, PictStandardA8);
-  ui->font.atlas_picture = XRenderCreatePicture(
-      ui->x_display, ui->font.atlas_pixmap, alpha_format, 0, NULL);
+  ui->font.atlas = bitmap;
   ui->font.ascent = (int)roundf((float)pixel_size * FONT_ASCENT_FRACTION);
   ui->font.descent = pixel_size - ui->font.ascent;
   return 0;
@@ -308,11 +851,16 @@ static void draw_text(Ui *ui, const char *text, int x, int baseline,
     const stbtt_bakedchar *glyph = &ui->font.glyphs[*character - 32];
     int width = glyph->x1 - glyph->x0;
     int height = glyph->y1 - glyph->y0;
-    XRenderComposite(ui->x_display, PictOpOver, color_value.picture,
-                     ui->font.atlas_picture, ui->target_picture, 0, 0,
-                     glyph->x0, glyph->y0, (int)roundf(cursor + glyph->xoff),
-                     (int)roundf((float)baseline + glyph->yoff),
-                     (unsigned int)width, (unsigned int)height);
+    int target_x = (int)roundf(cursor + glyph->xoff);
+    int target_y = (int)roundf((float)baseline + glyph->yoff);
+    for (int row = 0; row < height; row++) {
+      for (int column = 0; column < width; column++) {
+        unsigned int alpha =
+            ui->font.atlas[(size_t)(glyph->y0 + row) * FONT_ATLAS_SIZE +
+                           (size_t)(glyph->x0 + column)];
+        blend_pixel(ui, target_x + column, target_y + row, color_value, alpha);
+      }
+    }
     cursor += glyph->xadvance;
   }
 }
@@ -515,15 +1063,12 @@ static SnapResult nearest_snap(int value, int size, const DisplayList *list,
 }
 
 static void draw_grid(Ui *ui, Rect canvas) {
-  set_gc_color(ui, ui->theme.grid);
-  for (int x = canvas.x; x <= canvas.x + canvas.width; x += 24) {
-    XDrawLine(ui->x_display, ui->target, ui->gc, x, canvas.y, x,
-              canvas.y + canvas.height);
-  }
-  for (int y = canvas.y; y <= canvas.y + canvas.height; y += 24) {
-    XDrawLine(ui->x_display, ui->target, ui->gc, canvas.x, y,
-              canvas.x + canvas.width, y);
-  }
+  for (int x = canvas.x; x <= canvas.x + canvas.width; x += 24)
+    draw_line(ui, x, canvas.y, x, canvas.y + canvas.height, 1, false,
+              ui->theme.grid);
+  for (int y = canvas.y; y <= canvas.y + canvas.height; y += 24)
+    draw_line(ui, canvas.x, y, canvas.x + canvas.width, y, 1, false,
+              ui->theme.grid);
 }
 
 static void draw_guide(Ui *ui, ViewTransform transform, SnapResult snap,
@@ -533,19 +1078,14 @@ static void draw_guide(Ui *ui, ViewTransform transform, SnapResult snap,
                              (float)snap.guide_coordinate * transform.scale)
                : (int)roundf(transform.origin_y +
                              (float)snap.guide_coordinate * transform.scale);
-  set_gc_color(ui, ui->theme.accent);
-  XSetLineAttributes(ui->x_display, ui->gc, snap.centerline ? 2U : 1U,
-                     LineOnOffDash, CapRound, JoinRound);
-  char dash[] = {6, 5};
-  XSetDashes(ui->x_display, ui->gc, 0, dash, 2);
-  if (vertical) {
-    XDrawLine(ui->x_display, ui->target, ui->gc, coordinate, transform.canvas.y,
-              coordinate, transform.canvas.y + transform.canvas.height);
-  } else {
-    XDrawLine(ui->x_display, ui->target, ui->gc, transform.canvas.x, coordinate,
-              transform.canvas.x + transform.canvas.width, coordinate);
-  }
-  XSetLineAttributes(ui->x_display, ui->gc, 1U, LineSolid, CapRound, JoinRound);
+  if (vertical)
+    draw_line(ui, coordinate, transform.canvas.y, coordinate,
+              transform.canvas.y + transform.canvas.height,
+              snap.centerline ? 2 : 1, true, ui->theme.accent);
+  else
+    draw_line(ui, transform.canvas.x, coordinate,
+              transform.canvas.x + transform.canvas.width, coordinate,
+              snap.centerline ? 2 : 1, true, ui->theme.accent);
 }
 
 static bool draw_button(Ui *ui, Rect rectangle, const char *label, bool primary,
@@ -563,30 +1103,34 @@ static bool draw_button(Ui *ui, Rect rectangle, const char *label, bool primary,
   return hovered && released;
 }
 
+static void fill_circle(Ui *ui, int center_x, int center_y, int radius,
+                        UiColor color_value) {
+  for (int y = -radius; y <= radius; y++) {
+    int extent = (int)sqrt((double)(radius * radius - y * y));
+    fill_rect(ui, (Rect){center_x - extent, center_y + y, extent * 2 + 1, 1},
+              color_value);
+  }
+}
+
 static bool draw_close_button(Ui *ui, int center_x, int center_y, bool focused,
                               int mouse_x, int mouse_y, bool released) {
   int radius = 16;
   int dx = mouse_x - center_x;
   int dy = mouse_y - center_y;
   bool hovered = dx * dx + dy * dy <= radius * radius;
-  set_gc_color(ui, hovered ? ui->theme.button_hover : ui->theme.button);
-  XFillArc(ui->x_display, ui->target, ui->gc, center_x - radius,
-           center_y - radius, (unsigned int)(radius * 2),
-           (unsigned int)(radius * 2), 0, 360 * 64);
+  fill_circle(ui, center_x, center_y, radius,
+              hovered ? ui->theme.button_hover : ui->theme.button);
   if (focused) {
-    set_gc_color(ui, ui->theme.accent);
-    XSetLineAttributes(ui->x_display, ui->gc, 2U, LineSolid, CapRound,
-                       JoinRound);
-    XDrawArc(ui->x_display, ui->target, ui->gc, center_x - radius,
-             center_y - radius, (unsigned int)(radius * 2),
-             (unsigned int)(radius * 2), 0, 360 * 64);
+    for (int angle = 0; angle < 360; angle++) {
+      double radians = (double)angle * 3.14159265358979323846 / 180.0;
+      put_pixel(ui, center_x + (int)round(cos(radians) * radius),
+                center_y + (int)round(sin(radians) * radius), ui->theme.accent);
+    }
   }
-  set_gc_color(ui, ui->theme.muted);
-  XSetLineAttributes(ui->x_display, ui->gc, 2U, LineSolid, CapRound, JoinRound);
-  XDrawLine(ui->x_display, ui->target, ui->gc, center_x - 5, center_y - 5,
-            center_x + 5, center_y + 5);
-  XDrawLine(ui->x_display, ui->target, ui->gc, center_x + 5, center_y - 5,
-            center_x - 5, center_y + 5);
+  draw_line(ui, center_x - 5, center_y - 5, center_x + 5, center_y + 5, 2,
+            false, ui->theme.muted);
+  draw_line(ui, center_x + 5, center_y - 5, center_x - 5, center_y + 5, 2,
+            false, ui->theme.muted);
   return hovered && released;
 }
 
@@ -664,37 +1208,6 @@ static const char *resolve_font_path(const AppConfig *config, char *buffer,
   return "assets/DejaVuSansMono.ttf";
 }
 
-static void configure_dialog_window(Ui *ui) {
-  typedef struct {
-    unsigned long flags;
-    unsigned long functions;
-    unsigned long decorations;
-    long input_mode;
-    unsigned long status;
-  } MotifHints;
-  MotifHints motif = {.flags = 2, .decorations = 0};
-  Atom motif_property = XInternAtom(ui->x_display, "_MOTIF_WM_HINTS", False);
-  XChangeProperty(ui->x_display, ui->window, motif_property, motif_property, 32,
-                  PropModeReplace, (unsigned char *)&motif, 5);
-
-  Atom window_type = XInternAtom(ui->x_display, "_NET_WM_WINDOW_TYPE", False);
-  Atom dialog_type =
-      XInternAtom(ui->x_display, "_NET_WM_WINDOW_TYPE_DIALOG", False);
-  XChangeProperty(ui->x_display, ui->window, window_type, XA_ATOM, 32,
-                  PropModeReplace, (unsigned char *)&dialog_type, 1);
-  XSetTransientForHint(ui->x_display, ui->window,
-                       RootWindow(ui->x_display, ui->screen));
-
-  XSizeHints size_hints = {
-      .flags = PMinSize | PMaxSize,
-      .min_width = ui->width,
-      .min_height = ui->height,
-      .max_width = ui->width,
-      .max_height = ui->height,
-  };
-  XSetWMNormalHints(ui->x_display, ui->window, &size_hints);
-}
-
 static void print_usage(FILE *stream) {
   fprintf(
       stream,
@@ -769,53 +1282,29 @@ int main(int argc, char **argv) {
     return result == 0 ? 0 : 1;
   }
 
-  Ui ui = {0};
-  ui.x_display = XOpenDisplay(NULL);
-  if (ui.x_display == NULL) {
-    fprintf(stderr, "display-layout: cannot open X display\n");
+  int width = configured_dimension(config.width, 1920, 720);
+  int height = configured_dimension(config.height, 1080, 520);
+  Ui ui;
+  if (ui_init(&ui, width, height, error, sizeof(error)) != 0) {
+    fprintf(stderr, "display-layout: %s\n", error);
+    ui_destroy(&ui);
     backend_close(&backend);
     return 1;
   }
-  ui.screen = DefaultScreen(ui.x_display);
-  ui.visual = DefaultVisual(ui.x_display, ui.screen);
-  ui.colormap = DefaultColormap(ui.x_display, ui.screen);
-  int screen_width = DisplayWidth(ui.x_display, ui.screen);
-  int screen_height = DisplayHeight(ui.x_display, ui.screen);
-  ui.width = configured_dimension(config.width, screen_width, 720);
-  ui.height = configured_dimension(config.height, screen_height, 520);
-  ui.window = XCreateSimpleWindow(
-      ui.x_display, RootWindow(ui.x_display, ui.screen),
-      (screen_width - ui.width) / 2, (screen_height - ui.height) / 2,
-      (unsigned int)ui.width, (unsigned int)ui.height, 0, 0, 0);
-  XStoreName(ui.x_display, ui.window, "Display Layout Editor");
-  XClassHint class_hint = {.res_name = "display-layout-editor",
-                           .res_class = "DisplayLayoutEditor"};
-  XSetClassHint(ui.x_display, ui.window, &class_hint);
-  configure_dialog_window(&ui);
-  XSelectInput(ui.x_display, ui.window,
-               ExposureMask | ButtonPressMask | ButtonReleaseMask |
-                   PointerMotionMask | KeyPressMask | StructureNotifyMask);
-  Atom wm_delete = XInternAtom(ui.x_display, "WM_DELETE_WINDOW", False);
-  XSetWMProtocols(ui.x_display, ui.window, &wm_delete, 1);
-  resize_buffer(&ui, ui.width, ui.height);
   char font_path[1024];
   const char *resolved_font =
       resolve_font_path(&config, font_path, sizeof(font_path));
   if (load_font(&ui, resolved_font, config.font_size) != 0) {
     fprintf(stderr, "display-layout: cannot load vector font: %s\n",
             resolved_font);
-    XCloseDisplay(ui.x_display);
+    ui_destroy(&ui);
     backend_close(&backend);
     return 1;
   }
-  ui.normal_cursor = XCreateFontCursor(ui.x_display, XC_left_ptr);
-  ui.hand_cursor = XCreateFontCursor(ui.x_display, XC_hand2);
-  XDefineCursor(ui.x_display, ui.window, ui.normal_cursor);
   ui.theme = (config.theme == THEME_LIGHT ||
               (config.theme == THEME_SYSTEM && system_prefers_light()))
                  ? light_theme(&ui)
                  : dark_theme(&ui);
-  XMapRaised(ui.x_display, ui.window);
 
   int selected = displays.count > 0 ? 0 : -1;
   bool dragging = false;
@@ -823,103 +1312,88 @@ int main(int argc, char **argv) {
   int drag_mouse_y = 0;
   int drag_display_x = 0;
   int drag_display_y = 0;
-  int mouse_x = -1;
-  int mouse_y = -1;
-  bool mouse_released = false;
   SnapResult horizontal_snap = {0};
   SnapResult vertical_snap = {0};
   bool running = true;
   bool redraw = true;
   int focused_control = 2;
-  bool keyboard_activate = false;
 
   while (running) {
-    mouse_released = false;
-    keyboard_activate = false;
-    while (XPending(ui.x_display) > 0) {
-      XEvent event;
-      XNextEvent(ui.x_display, &event);
-      if (event.type == Expose) {
-        redraw = true;
-      } else if (event.type == ConfigureNotify) {
-        if (ui.width != event.xconfigure.width ||
-            ui.height != event.xconfigure.height) {
-          resize_buffer(&ui, event.xconfigure.width, event.xconfigure.height);
-        }
-        redraw = true;
-      } else if (event.type == MotionNotify) {
-        mouse_x = event.xmotion.x;
-        mouse_y = event.xmotion.y;
-        redraw = true;
-      } else if (event.type == ButtonPress && event.xbutton.button == Button1) {
-        mouse_x = event.xbutton.x;
-        mouse_y = event.xbutton.y;
-        int margin = UI_MARGIN;
-        int button_y = ui.height - UI_BUTTON_HEIGHT - UI_BUTTON_BOTTOM_MARGIN;
-        Rect identify_control = {margin, button_y, 114, UI_BUTTON_HEIGHT};
-        Rect apply_control = {ui.width - margin - UI_BUTTON_WIDTH, button_y,
-                              UI_BUTTON_WIDTH, UI_BUTTON_HEIGHT};
-        Rect reset_control = {apply_control.x - UI_BUTTON_WIDTH - UI_BUTTON_GAP,
-                              button_y, UI_BUTTON_WIDTH, UI_BUTTON_HEIGHT};
-        int close_dx = mouse_x - (ui.width - UI_CLOSE_CENTER);
-        int close_dy = mouse_y - UI_CLOSE_CENTER;
-        if (point_in_rect(mouse_x, mouse_y, identify_control)) {
-          focused_control = 0;
-        } else if (point_in_rect(mouse_x, mouse_y, reset_control)) {
-          focused_control = 1;
-        } else if (point_in_rect(mouse_x, mouse_y, apply_control)) {
-          focused_control = 2;
-        } else if (close_dx * close_dx + close_dy * close_dy <=
-                   UI_CLOSE_RADIUS * UI_CLOSE_RADIUS) {
-          focused_control = 3;
-        }
-        Rect canvas = {margin, UI_HEADER_HEIGHT, ui.width - margin * 2,
-                       ui.height - UI_HEADER_HEIGHT - UI_FOOTER_HEIGHT};
-        ViewTransform transform = view_transform(&displays, canvas);
-        if (point_in_rect(mouse_x, mouse_y, canvas)) {
-          for (int index = (int)displays.count - 1; index >= 0; index--) {
-            if (point_in_rect(
-                    mouse_x, mouse_y,
-                    display_rect(&displays.displays[index], transform))) {
-              selected = index;
-              dragging = true;
-              drag_view = displays;
-              drag_mouse_x = mouse_x;
-              drag_mouse_y = mouse_y;
-              drag_display_x = displays.displays[index].x;
-              drag_display_y = displays.displays[index].y;
-              break;
-            }
+    if (!redraw && !ui.needs_redraw) {
+      if (wl_display_dispatch(ui.display) < 0) {
+        fprintf(stderr,
+                "display-layout: Wayland compositor closed the connection\n");
+        break;
+      }
+    } else {
+      wl_display_dispatch_pending(ui.display);
+    }
+    if (ui.close_requested)
+      running = false;
+
+    int mouse_x = ui.mouse_x;
+    int mouse_y = ui.mouse_y;
+    bool mouse_released = ui.pointer_released;
+    bool keyboard_activate = false;
+    redraw = redraw || ui.needs_redraw;
+
+    if (ui.pointer_pressed) {
+      int margin = UI_MARGIN;
+      int button_y = ui.height - UI_BUTTON_HEIGHT - UI_BUTTON_BOTTOM_MARGIN;
+      Rect identify_control = {margin, button_y, 114, UI_BUTTON_HEIGHT};
+      Rect apply_control = {ui.width - margin - UI_BUTTON_WIDTH, button_y,
+                            UI_BUTTON_WIDTH, UI_BUTTON_HEIGHT};
+      Rect reset_control = {apply_control.x - UI_BUTTON_WIDTH - UI_BUTTON_GAP,
+                            button_y, UI_BUTTON_WIDTH, UI_BUTTON_HEIGHT};
+      int close_dx = mouse_x - (ui.width - UI_CLOSE_CENTER);
+      int close_dy = mouse_y - UI_CLOSE_CENTER;
+      if (point_in_rect(mouse_x, mouse_y, identify_control))
+        focused_control = 0;
+      else if (point_in_rect(mouse_x, mouse_y, reset_control))
+        focused_control = 1;
+      else if (point_in_rect(mouse_x, mouse_y, apply_control))
+        focused_control = 2;
+      else if (close_dx * close_dx + close_dy * close_dy <=
+               UI_CLOSE_RADIUS * UI_CLOSE_RADIUS)
+        focused_control = 3;
+
+      Rect canvas = {margin, UI_HEADER_HEIGHT, ui.width - margin * 2,
+                     ui.height - UI_HEADER_HEIGHT - UI_FOOTER_HEIGHT};
+      ViewTransform transform = view_transform(&displays, canvas);
+      if (point_in_rect(mouse_x, mouse_y, canvas)) {
+        for (int index = (int)displays.count - 1; index >= 0; index--) {
+          if (point_in_rect(
+                  mouse_x, mouse_y,
+                  display_rect(&displays.displays[index], transform))) {
+            selected = index;
+            dragging = true;
+            drag_view = displays;
+            drag_mouse_x = mouse_x;
+            drag_mouse_y = mouse_y;
+            drag_display_x = displays.displays[index].x;
+            drag_display_y = displays.displays[index].y;
+            break;
           }
         }
-        redraw = true;
-      } else if (event.type == ButtonRelease &&
-                 event.xbutton.button == Button1) {
-        mouse_x = event.xbutton.x;
-        mouse_y = event.xbutton.y;
-        dragging = false;
-        mouse_released = true;
-        redraw = true;
-      } else if (event.type == KeyPress) {
-        KeySym key = XLookupKeysym(&event.xkey, 0);
-        if (key == XK_Escape) {
-          running = false;
-        } else if (key == XK_Tab) {
-          int direction = (event.xkey.state & ShiftMask) != 0 ? -1 : 1;
-          focused_control = (focused_control + direction + 4) % 4;
-          redraw = true;
-        } else if (key == XK_Return || key == XK_KP_Enter || key == XK_space) {
-          keyboard_activate = true;
-          redraw = true;
-        } else if ((key == XK_r || key == XK_R) &&
-                   (event.xkey.state & ControlMask) != 0) {
-          displays = original;
-          redraw = true;
-        }
-      } else if (event.type == ClientMessage &&
-                 (Atom)event.xclient.data.l[0] == wm_delete) {
-        running = false;
       }
+    }
+    if (ui.pointer_released)
+      dragging = false;
+
+    if (ui.key_pressed) {
+      if (ui.key == XKB_KEY_Escape) {
+        running = false;
+      } else if (ui.key == XKB_KEY_Tab) {
+        int direction = ui.shift_down ? -1 : 1;
+        focused_control = (focused_control + direction + 4) % 4;
+      } else if (ui.key == XKB_KEY_Return || ui.key == XKB_KEY_KP_Enter ||
+                 ui.key == XKB_KEY_space) {
+        keyboard_activate = true;
+      } else if ((ui.key == XKB_KEY_r || ui.key == XKB_KEY_R) &&
+                 ui.control_down) {
+        displays = original;
+      }
+      redraw = true;
     }
 
     int margin = UI_MARGIN;
@@ -945,7 +1419,12 @@ int main(int argc, char **argv) {
       redraw = true;
     }
 
-    if (redraw) {
+    if (redraw && running) {
+      if (begin_frame(&ui) != 0) {
+        fprintf(stderr,
+                "display-layout: cannot acquire Wayland frame buffer\n");
+        break;
+      }
       fill_rect(&ui, (Rect){0, 0, ui.width, ui.height}, ui.theme.surface);
       bool close_clicked = draw_close_button(&ui, ui.width - UI_CLOSE_CENTER,
                                              24, focused_control == 3, mouse_x,
@@ -968,12 +1447,10 @@ int main(int argc, char **argv) {
                      display_rect(&displays.displays[selected], transform),
                      true, (size_t)selected);
       }
-      if (dragging && horizontal_snap.snapped) {
+      if (dragging && horizontal_snap.snapped)
         draw_guide(&ui, transform, horizontal_snap, true);
-      }
-      if (dragging && vertical_snap.snapped) {
+      if (dragging && vertical_snap.snapped)
         draw_guide(&ui, transform, vertical_snap, false);
-      }
 
       int button_y = ui.height - UI_BUTTON_HEIGHT - UI_BUTTON_BOTTOM_MARGIN;
       Rect identify_button = {margin, button_y, 114, UI_BUTTON_HEIGHT};
@@ -996,61 +1473,35 @@ int main(int argc, char **argv) {
           reset_clicked || (keyboard_activate && focused_control == 1);
       apply_clicked =
           apply_clicked || (keyboard_activate && focused_control == 2);
-      int close_dx = mouse_x - (ui.width - UI_CLOSE_CENTER);
-      int close_dy = mouse_y - UI_CLOSE_CENTER;
-      bool over_close = close_dx * close_dx + close_dy * close_dy <=
-                        UI_CLOSE_RADIUS * UI_CLOSE_RADIUS;
-      bool over_button = point_in_rect(mouse_x, mouse_y, identify_button) ||
-                         point_in_rect(mouse_x, mouse_y, reset_button) ||
-                         point_in_rect(mouse_x, mouse_y, apply_button);
-      XDefineCursor(ui.x_display, ui.window,
-                    over_close || over_button ? ui.hand_cursor
-                                              : ui.normal_cursor);
-      set_gc_color(&ui, ui.theme.border);
-      XDrawLine(ui.x_display, ui.buffer, ui.gc, 0, ui.height - UI_FOOTER_HEIGHT,
-                ui.width, ui.height - UI_FOOTER_HEIGHT);
+      draw_line(&ui, 0, ui.height - UI_FOOTER_HEIGHT, ui.width,
+                ui.height - UI_FOOTER_HEIGHT, 1, false, ui.theme.border);
 
-      if (close_clicked) {
+      if (close_clicked)
         running = false;
-      }
       if (identify_clicked && backend.ops->identify != NULL &&
           backend.ops->identify(&backend, &displays,
                                 (unsigned int)config.identify_duration_ms,
-                                error, sizeof(error)) != 0) {
+                                error, sizeof(error)) != 0)
         fprintf(stderr, "display-layout: %s\n", error);
-      }
-      if (reset_clicked) {
+      if (reset_clicked)
         displays = original;
-      }
       if (apply_clicked) {
-        if (backend.ops->apply(&backend, &displays, error, sizeof(error)) ==
-            0) {
+        if (backend.ops->apply(&backend, &displays, error, sizeof(error)) == 0)
           running = false;
-        } else {
+        else
           fprintf(stderr, "display-layout: %s\n", error);
-        }
       }
-      XCopyArea(ui.x_display, ui.buffer, ui.window, ui.gc, 0, 0,
-                (unsigned int)ui.width, (unsigned int)ui.height, 0, 0);
-      XFlush(ui.x_display);
-      redraw = dragging;
+      present_frame(&ui);
+      redraw = false;
     }
 
-    if (!redraw && running) {
-      struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
-      nanosleep(&pause, NULL);
-    }
+    ui.pointer_pressed = false;
+    ui.pointer_released = false;
+    ui.key_pressed = false;
+    ui.needs_redraw = false;
   }
 
-  XRenderFreePicture(ui.x_display, ui.font.atlas_picture);
-  XFreePixmap(ui.x_display, ui.font.atlas_pixmap);
-  XRenderFreePicture(ui.x_display, ui.target_picture);
-  XFreeCursor(ui.x_display, ui.hand_cursor);
-  XFreeCursor(ui.x_display, ui.normal_cursor);
-  XFreeGC(ui.x_display, ui.gc);
-  XFreePixmap(ui.x_display, ui.buffer);
-  XDestroyWindow(ui.x_display, ui.window);
-  XCloseDisplay(ui.x_display);
+  ui_destroy(&ui);
   backend_close(&backend);
   return 0;
 }

@@ -39,60 +39,94 @@ let
       ln -s compositor-fixture $out/bin/$name
     done
   '';
+  swayConfig = pkgs.writeText "display-layout-test-sway.conf" ''
+    output HEADLESS-1 mode 1280x800
+    default_border none
+    default_floating_border none
+    for_window [app_id="display-layout-editor"] floating enable
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "display-layout-backend-matrix";
   nodes.machine = {
-    services = {
-      xserver = {
-        enable = true;
-        displayManager.lightdm.enable = true;
-        desktopManager.xfce.enable = true;
-      };
-      displayManager.autoLogin = {
-        enable = true;
-        user = "alice";
-      };
-    };
     users.users.alice = {
       isNormalUser = true;
-      extraGroups = [ "video" ];
+      extraGroups = [ "input" ];
     };
     environment.systemPackages = [
       package
-      pkgs.xdotool
+      pkgs.grim
+      pkgs.sway
+      pkgs.wtype
     ];
     virtualisation.memorySize = 2048;
   };
   testScript = ''
     start_all()
-    machine.wait_for_x()
-    machine.wait_for_file("/home/alice/.Xauthority")
-    machine.succeed("xauth merge /home/alice/.Xauthority")
-    machine.wait_for_window("Desktop")
+    machine.wait_for_unit("multi-user.target")
+    machine.succeed("install -d -m 0700 -o alice -g users /run/user/1000")
+    machine.execute(
+        "su -s ${pkgs.runtimeShell} alice -c '"
+        "XDG_RUNTIME_DIR=/run/user/1000 "
+        "WLR_BACKENDS=headless WLR_RENDERER=pixman "
+        "${pkgs.sway}/bin/sway --unsupported-gpu --config ${swayConfig} "
+        ">/tmp/sway.log 2>&1 &'"
+    )
+    machine.wait_until_succeeds(
+        "find /run/user/1000 -maxdepth 1 -type s -name 'sway-ipc.*.sock' | grep -q .",
+        timeout=20,
+    )
+    machine.wait_until_succeeds(
+        "find /run/user/1000 -maxdepth 1 -type s -name 'wayland-*' | grep -q .",
+        timeout=20,
+    )
+    wayland_display = machine.succeed(
+        "basename $(find /run/user/1000 -maxdepth 1 -type s -name 'wayland-*' | head -1)"
+    ).strip()
+    sway_socket = machine.succeed(
+        "find /run/user/1000 -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1"
+    ).strip()
+    wayland_env = "XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=" + wayland_display
+    sway_env = "SWAYSOCK=" + sway_socket
 
     for backend in ["niri", "sway", "hyprland", "wlr", "kscreen", "gnome"]:
         with subtest(f"render and apply through {backend}"):
             machine.execute(
-                "su - alice -c 'DISPLAY=:0 DISPLAY_LAYOUT_TEST_BACKEND=" + backend +
+                "su -s ${pkgs.runtimeShell} alice -c '" + wayland_env +
+                " DISPLAY_LAYOUT_TEST_BACKEND=" + backend +
                 " PATH=${fixtures}/bin:$PATH ${package}/bin/.display-layout-wrapped --backend " +
                 backend + " >/tmp/display-layout-" + backend + ".log 2>&1 &'"
             )
             machine.wait_until_succeeds(
-                "DISPLAY=:0 xdotool search --name 'Display Layout Editor' >/dev/null",
+                sway_env + " ${pkgs.sway}/bin/swaymsg -t get_tree "
+                "| grep -q '\"app_id\": \"display-layout-editor\"'",
                 timeout=10,
             )
-            machine.sleep(1)
-            machine.screenshot("backend-" + backend)
+            # wl_pointer v5 emits a frame event after enter/motion. Keeping a
+            # real libinput pointer on the seat makes null listener callbacks
+            # fail here instead of only in interactive compositor sessions.
             machine.succeed(
-                "window=$(DISPLAY=:0 xdotool search --name 'Display Layout Editor' | head -1); "
-                "eval $(DISPLAY=:0 xdotool getwindowgeometry --shell $window); "
-                "DISPLAY=:0 xdotool windowactivate --sync $window "
-                "mousemove --window $window $((WIDTH-84)) $((HEIGHT-34)) click 1"
+                sway_env + " ${pkgs.sway}/bin/swaymsg "
+                "seat seat0 cursor set 640 400"
+            )
+            machine.wait_until_succeeds(
+                sway_env + " ${pkgs.sway}/bin/swaymsg -t get_tree "
+                "| grep -q '\"app_id\": \"display-layout-editor\"'",
+                timeout=5,
+            )
+            machine.succeed(
+                "su -s ${pkgs.runtimeShell} alice -c '" + wayland_env +
+                " ${pkgs.grim}/bin/grim /tmp/backend-" + backend + ".png'"
+            )
+            machine.copy_from_machine("/tmp/backend-" + backend + ".png")
+            machine.succeed(
+                "su -s ${pkgs.runtimeShell} alice -c '" + wayland_env +
+                " ${pkgs.wtype}/bin/wtype -s 250 -k Return'"
             )
             machine.wait_until_succeeds("test -e /tmp/applied-" + backend, timeout=10)
             machine.wait_until_fails(
-                "DISPLAY=:0 xdotool search --name 'Display Layout Editor' >/dev/null"
+                sway_env + " ${pkgs.sway}/bin/swaymsg -t get_tree "
+                "| grep -q '\"app_id\": \"display-layout-editor\"'"
             )
   '';
 }

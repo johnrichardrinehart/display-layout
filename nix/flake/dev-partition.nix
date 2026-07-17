@@ -78,8 +78,7 @@
           pkgs.gdb
           pkgs.gnumake
           pkgs.desktop-file-utils
-          pkgs.libX11
-          pkgs.libXrender
+          pkgs.libxkbcommon
           pkgs.pkg-config
           pkgs.wayland
           pkgs.wayland-scanner

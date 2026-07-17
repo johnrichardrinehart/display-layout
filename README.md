@@ -19,6 +19,8 @@ Display Layout selects a backend from the current desktop automatically. The sup
 | GNOME Shell           | Mutter DisplayConfig via `gdctl`          |
 | KDE Plasma            | KScreen via `kscreen-doctor`              |
 
+Display Layout is Wayland-only: both the editor and display identification overlays are native Wayland clients, and XWayland is neither used nor required. X11 sessions and XRandR are intentionally unsupported.
+
 `wlr-randr` is included in the Nix package. The other tools are supplied by their compositor or desktop session. Explicit backend names are `niri`, `sway`, `hyprland`, `wlr`, `gnome`, and `kscreen`; `river`, `wayfire`, `labwc`, `mutter`, `kde`, and `plasma` are accepted aliases.
 
 ## Features
@@ -69,7 +71,7 @@ Use `theme = dark`, `light`, or `system`. System mode checks common desktop and 
 
 The generic application owns rendering, interaction, configuration, and the display layout model:
 
-- `src/main.c` — backend-independent UI and interaction
+- `src/main.c` — native Wayland UI, software rendering, and interaction
 - `src/model.h` — backend-neutral display data
 - `src/backend.h` / `src/backend.c` — backend contract and selection
 - `src/backend_niri.c` — niri IPC
@@ -93,7 +95,7 @@ direnv allow
 nix flake check
 ```
 
-On x86-64, the flake check includes a NixOS VM test. It launches the packaged editor against contract fixtures for all six backend APIs, captures `backend-*.png` screenshots from the VM, activates Apply, and verifies that each compositor command receives the layout.
+On x86-64, the flake check includes a NixOS VM test. It launches the packaged editor without XWayland under a headless Sway compositor, exercises contract fixtures for all six backend APIs, captures `backend-*.png` screenshots, activates Apply through the compositor's Wayland seat, and verifies that each compositor command receives the layout.
 
 Development tooling uses:
 
