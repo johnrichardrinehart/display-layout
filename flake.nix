@@ -57,6 +57,7 @@
 
             strictDeps = true;
             nativeBuildInputs = [
+              pkgs.makeWrapper
               pkgs.pkg-config
               pkgs.wayland-scanner
               pkgs.wayland-protocols
@@ -78,6 +79,10 @@
               "DESTDIR=$(out)"
               "PREFIX="
             ];
+            postFixup = ''
+              wrapProgram $out/bin/display-layout \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.wlr-randr ]}
+            '';
 
             meta = {
               description = "Focused drag-and-drop display layout editor";

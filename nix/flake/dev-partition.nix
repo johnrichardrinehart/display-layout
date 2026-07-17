@@ -64,6 +64,12 @@
           echo 'ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab  ${self}/src/third_party/stb_truetype.h' | sha256sum --check
           touch $out
         '';
+      }
+      // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        backend-vm = import ../../tests/nixos/backend-matrix.nix {
+          inherit pkgs;
+          package = self.packages.${system}.default;
+        };
       };
 
       devShells.default = pkgs.mkShell {
