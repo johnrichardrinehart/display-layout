@@ -17,6 +17,12 @@ typedef struct {
   int y;
   int width;
   int height;
+  int mode_width;
+  int mode_height;
+  float refresh_rate;
+  float scale;
+  int transform;
+  bool primary;
   bool enabled;
 } LayoutDisplay;
 

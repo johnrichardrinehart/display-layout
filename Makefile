@@ -21,9 +21,11 @@ CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS ?=
 UI_LIBS = -lX11 -lXrender $(WAYLAND_LIBS)
 
-SOURCES = src/main.c src/backend.c src/backend_niri.c src/config.c \
-          src/identifier_wayland.c src/stb_truetype_impl.c $(LAYER_SHELL_CODE) \
-          $(XDG_SHELL_CODE)
+BACKEND_SOURCES = src/backend.c src/backend_common.c src/jsmn_impl.c src/backend_niri.c \
+                  src/backend_sway.c src/backend_hyprland.c src/backend_wlr.c \
+                  src/backend_kscreen.c src/backend_gnome.c
+SOURCES = src/main.c $(BACKEND_SOURCES) src/config.c src/identifier_wayland.c \
+          src/stb_truetype_impl.c $(LAYER_SHELL_CODE) $(XDG_SHELL_CODE)
 OBJECTS = $(SOURCES:.c=.o)
 
 .PHONY: all clean check install
@@ -52,14 +54,14 @@ $(LAYER_SHELL_CODE:.c=.o): $(LAYER_SHELL_HEADER)
 tests/config_test: tests/config_test.c src/config.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/config_test.c src/config.c
 
-tests/backend_niri_test: tests/backend_niri_test.c src/backend_niri.c \
-                           src/identifier_wayland.c src/stb_truetype_impl.c \
-                           $(LAYER_SHELL_CODE) $(XDG_SHELL_CODE)
+tests/backend_test: tests/backend_test.c $(BACKEND_SOURCES) \
+                    src/identifier_wayland.c src/stb_truetype_impl.c \
+                    $(LAYER_SHELL_CODE) $(XDG_SHELL_CODE)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(WAYLAND_LIBS) -lm
 
-check: tests/config_test tests/backend_niri_test
+check: tests/config_test tests/backend_test
 	./tests/config_test
-	./tests/backend_niri_test
+	./tests/backend_test
 
 install: display-layout
 	install -Dm755 display-layout $(DESTDIR)$(PREFIX)/bin/display-layout
@@ -70,5 +72,5 @@ install: display-layout
 	install -Dm644 assets/DejaVu-LICENSE.txt $(DESTDIR)$(PREFIX)/share/doc/display-layout/DejaVu-LICENSE.txt
 
 clean:
-	rm -f display-layout $(OBJECTS) tests/config_test tests/backend_niri_test
+	rm -f display-layout $(OBJECTS) tests/config_test tests/backend_test tests/backend_niri_test
 	rm -rf $(GENERATED_DIR)
